@@ -1,0 +1,206 @@
+#!/usr/bin/python3
+
+import os, sys, re, argparse, select, subprocess, time
+import array, fcntl, pty, tty, termios, signal
+
+stdi = pty.STDIN_FILENO
+stdo = pty.STDOUT_FILENO
+
+def outp(data, fnum):
+	try:
+		os.write(fnum, data)
+		return 1
+	except:
+		return 0
+
+def inpt(fnum):
+	try:
+		return os.read(fnum, 1024)
+	except:
+		return b""
+
+def proc(pidn):
+	try:
+		os.kill(pidn, 0)
+		return True
+	except:
+		return False
+
+def scan(data, buff, proc=False):
+	x = 0 ; l = len(data)
+	while (x < l):
+		chrs = data[x]
+		if ((chrs == 10) or (chrs == 13)):
+			buff = b""
+		elif (chrs == 27):
+			if (proc):
+				x += 3
+				continue
+			else:
+				buff += chr(chrs).encode()
+		elif (chrs < 32):
+			if (proc):
+				buff = b""
+			else:
+				buff += chr(chrs).encode()
+		elif (chrs == 127):
+			buff = buff[:-1]
+		else:
+			buff += chr(chrs).encode()
+		x += 1
+	# sys.stderr.write("debug [%s]\n"%(buff))
+	return buff
+
+def size(pafd, chfd):
+	buff = array.array("h", [0, 0, 0, 0])
+	fcntl.ioctl(pafd, termios.TIOCGWINSZ, buff, True)
+	fcntl.ioctl(chfd, termios.TIOCSWINSZ, buff)
+
+def wins(signo, frame):
+	global stdo, chfd
+	size(stdo, chfd)
+
+def rout(pson, repl, regi, rego, stdo):
+	pref = regi.group(1)
+	psap = regi.group(2)
+	psbp = rego.group(1)
+	text = rego.group(2)
+	prom = psap
+	if (not pson):
+		prom = psbp.replace(repl, pref)
+	blen = (len(prom) + len(psbp) + len(text))
+	back = (b"\b \b" * blen)
+	data = (back + prom + text)
+	return outp(data, stdo)
+
+def main():
+	global stdo, chfd
+
+	pars = argparse.ArgumentParser()
+	pars.add_argument("-p", "--prompt", action="store_true")
+	pars.add_argument("-r", "--replace", action="store_true")
+	args = pars.parse_args()
+
+	pson = True
+	if (args.replace):
+		pson = False
+
+	os.environ["SHELL"] = sys.argv[0]
+	if (not pson):
+		os.environ["EXEC"] = os.path.basename(sys.argv[0])
+
+	comd = ["/bin/bash", "-i", "-l"]
+
+	(cpid, chfd) = pty.fork()
+	if (cpid == pty.CHILD):
+		os.execlp(comd[0], *comd)
+
+	(irip, isip) = pty.openpty()
+	(irop, isop) = pty.openpty()
+	(irep, isep) = pty.openpty()
+	info = subprocess.Popen(comd, shell=False, universal_newlines=False, preexec_fn=os.setsid, stdin=isip, stdout=isop, stderr=isop)
+
+	mode = tty.tcgetattr(stdi)
+	tty.setraw(stdi)
+
+	olds = signal.signal(signal.SIGWINCH, wins)
+	size(stdo, chfd)
+
+	try:
+		stop = 0
+		wait = 1
+		send = b"\n"
+		repl = b""
+		buff = b""
+		disp = b""
+		rpsz = os.environ.get("PS0", "\[[^\]]+\]\$ ").encode()
+		rpso = (b"(%s)(.*)" % (rpsz))
+		rpst = (b"(.*)(%s)" % (rpso))
+		regi = None
+		rego = None
+
+		if (not pson):
+			send = b"eval $PS2\n"
+			repl = b"%PS2"
+
+		outp(b"set +m\n", chfd)
+		outp(b"set +m\n", irip)
+		outp(send, irip)
+
+		while (proc(cpid) and (stop == 0)):
+			loop = 1
+			while ((loop == 1) and (stop == 0)):
+				loop = 0
+				try:
+					(rfds, wfds, efds) = select.select([stdi, chfd], [], [stdi, chfd], 0.35)
+				except KeyboardInterrupt:
+					os.kill(cpid, signal.SIGINT)
+					(rfds, wfds, efds) = ([], [], [])
+				if (efds):
+					stop = 1
+				if (stdi in rfds):
+					data = inpt(stdi)
+					if (not data):
+						stop = 1
+					loop = outp(data, chfd)
+					if (data == b"\x04"):
+						stop = 1
+				if (chfd in rfds):
+					data = inpt(chfd)
+					if (not data):
+						stop = 1
+					buff = scan(data, buff, proc=True)
+					rego = re.match(rpso, buff)
+					if (regi and rego):
+						loop = rout(pson, repl, regi, rego, stdo)
+					else:
+						loop = outp(data, stdo)
+
+			loop = 1
+			while ((loop == 1) and (stop == 0)):
+				loop = 0
+				try:
+					(rfds, wfds, efds) = select.select([irop], [], [irop], 0.15)
+				except KeyboardInterrupt:
+					os.kill(cpid, signal.SIGINT)
+					(rfds, wfds, efds) = ([], [], [])
+				if (efds):
+					stop = 1
+				if (irop in rfds):
+					data = inpt(irop)
+					if (not data):
+						stop = 1
+					loop = 1
+					disp = scan(data, disp, proc=True)
+					regi = re.match(rpst, disp)
+
+			if (wait == 0):
+				loop = outp(send, irip)
+				wait = 1
+
+			if (regi and rego):
+				loop = rout(pson, repl, regi, rego, stdo)
+				wait = 0
+
+	finally:
+		try:
+			signal.signal(signal.SIGWINCH, olds)
+		except:
+			pass
+		try:
+			tty.tcsetattr(stdi, tty.TCSAFLUSH, mode)
+		except:
+			pass
+		try:
+			os.killpg(os.getpgid(info.pid), signal.SIGTERM)
+		except:
+			pass
+		try:
+			os.kill(cpid, signal.SIGTERM)
+		except:
+			pass
+
+	outp(b"\nfin\n", stdo)
+
+if (__name__ == "__main__"):
+	main()
